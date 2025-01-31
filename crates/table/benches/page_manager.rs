@@ -1,5 +1,5 @@
 use core::iter;
-use core::mem::{self, MaybeUninit};
+use core::mem;
 use core::time::Duration;
 use criterion::measurement::{Measurement, WallTime};
 use criterion::{
@@ -7,12 +7,15 @@ use criterion::{
 };
 use rand::rngs::StdRng;
 use rand::{Rng, SeedableRng};
+use spacetimedb_lib::db::raw_def::v9::RawIndexAlgorithm;
+use spacetimedb_lib::db::raw_def::v9::RawModuleDefV9Builder;
 use spacetimedb_primitives::{ColList, IndexId, TableId};
-use spacetimedb_sats::db::def::{TableDef, TableSchema};
 use spacetimedb_sats::{AlgebraicType, AlgebraicValue, ProductType, ProductValue};
+use spacetimedb_schema::def::ModuleDef;
+use spacetimedb_schema::schema::TableSchema;
 use spacetimedb_table::blob_store::NullBlobStore;
-use spacetimedb_table::btree_index::BTreeIndex;
-use spacetimedb_table::indexes::{PageOffset, RowPointer, Size, SquashedOffset, PAGE_DATA_SIZE};
+use spacetimedb_table::indexes::Byte;
+use spacetimedb_table::indexes::{Bytes, PageOffset, RowPointer, Size, SquashedOffset, PAGE_DATA_SIZE};
 use spacetimedb_table::layout::{row_size_for_bytes, row_size_for_type};
 use spacetimedb_table::pages::Pages;
 use spacetimedb_table::row_type_visitor::{row_type_visitor, VarLenVisitorProgram};
@@ -45,8 +48,11 @@ fn iter_time_with<P, B, X>(
     })
 }
 
-fn as_bytes<T>(t: &T) -> &[MaybeUninit<u8>] {
-    let ptr = (t as *const T).cast::<MaybeUninit<u8>>();
+// Strictly this would be unsafe,
+// since it causes UB when applied to types that contain padding/`poison`,
+// but it's a benchmark so who cares.
+fn as_bytes<T>(t: &T) -> &Bytes {
+    let ptr = (t as *const T).cast::<Byte>();
     unsafe { std::slice::from_raw_parts(ptr, mem::size_of::<T>()) }
 }
 
@@ -54,26 +60,32 @@ fn as_bytes<T>(t: &T) -> &[MaybeUninit<u8>] {
 unsafe trait Row {
     fn row_type() -> ProductType;
 
+    fn row_type_for_schema() -> ProductType {
+        let mut ty = Self::row_type();
+        // Ensure that we have names for every column,
+        // so that its accepted when used in a `ModuleDef` as a row type.
+        for (idx, elem) in ty.elements.iter_mut().enumerate() {
+            if elem.name.is_none() {
+                elem.name = Some(format!("col_{idx}").into());
+            }
+        }
+        ty
+    }
+
     fn var_len_visitor() -> VarLenVisitorProgram {
         row_type_visitor(&Self::row_type().into())
     }
-
-    fn from_product(prod: ProductValue) -> Self;
 
     fn to_product(self) -> ProductValue;
 }
 
 #[allow(clippy::missing_safety_doc)] // It's a benchmark, clippy. Who cares.
+/// Apply only to types which:
+/// - Contain no padding bytes.
+/// - Contain no members which are stored BFLATN as var-len.
 unsafe trait FixedLenRow: Row + Sized {
-    fn as_bytes(&self) -> &[MaybeUninit<u8>] {
+    fn as_bytes(&self) -> &Bytes {
         as_bytes(self)
-    }
-
-    unsafe fn from_bytes(bytes: &[MaybeUninit<u8>]) -> &Self {
-        let ptr = bytes.as_ptr();
-        debug_assert_eq!(ptr as usize % mem::align_of::<Self>(), 0);
-        debug_assert_eq!(bytes.len(), mem::size_of::<Self>());
-        unsafe { &*ptr.cast::<Self>() }
     }
 
     fn from_u64(u: u64) -> Self;
@@ -82,13 +94,6 @@ unsafe trait FixedLenRow: Row + Sized {
 unsafe impl Row for u64 {
     fn row_type() -> ProductType {
         [AlgebraicType::U64].into()
-    }
-
-    fn from_product(prod: ProductValue) -> Self {
-        match prod.elements[..] {
-            [AlgebraicValue::U64(n)] => n,
-            _ => panic!("Invalid product value for u64"),
-        }
     }
 
     fn to_product(self) -> ProductValue {
@@ -107,20 +112,12 @@ struct U32x8 {
     vals: [u32; 8],
 }
 
+// TODO: get rid of this once we change to >= Rust 1.79.
+const TY_U32: AlgebraicType = AlgebraicType::U32;
+
 unsafe impl Row for U32x8 {
     fn row_type() -> ProductType {
-        [AlgebraicType::U32; 8].into()
-    }
-
-    fn from_product(prod: ProductValue) -> Self {
-        match prod.elements[..] {
-            [AlgebraicValue::U32(n0), AlgebraicValue::U32(n1), AlgebraicValue::U32(n2), AlgebraicValue::U32(n3), AlgebraicValue::U32(n4), AlgebraicValue::U32(n5), AlgebraicValue::U32(n6), AlgebraicValue::U32(n7)] => {
-                U32x8 {
-                    vals: [n0, n1, n2, n3, n4, n5, n6, n7],
-                }
-            }
-            _ => panic!("Invalid product value for U32x8"),
-        }
+        [TY_U32; 8].into()
     }
 
     fn to_product(self) -> ProductValue {
@@ -141,17 +138,7 @@ struct U32x64 {
 
 unsafe impl Row for U32x64 {
     fn row_type() -> ProductType {
-        [AlgebraicType::U32; 64].into()
-    }
-
-    fn from_product(prod: ProductValue) -> Self {
-        let vals: Vec<u32> = prod
-            .elements
-            .into_iter()
-            .map(|val| *val.as_u32().expect("Invalid product value for U32x64"))
-            .collect();
-        let vals: [u32; 64] = vals.try_into().expect("Invalid product value for U32x64");
-        U32x64 { vals }
+        [TY_U32; 64].into()
     }
 
     fn to_product(self) -> ProductValue {
@@ -165,18 +152,9 @@ unsafe impl FixedLenRow for U32x64 {
     }
 }
 
-unsafe impl Row for String {
+unsafe impl Row for Box<str> {
     fn row_type() -> ProductType {
         [AlgebraicType::String].into()
-    }
-
-    fn from_product(prod: ProductValue) -> Self {
-        prod.elements
-            .into_iter()
-            .next()
-            .expect("Invalid ProductValue for String: not enough elements")
-            .into_string()
-            .expect("Invalid ProductValue for String: not a String")
     }
 
     fn to_product(self) -> ProductValue {
@@ -236,6 +214,7 @@ fn insert_one_page_fixed_len(c: &mut Criterion) {
         ));
         group.bench_function(name, |b| {
             let mut pages = Pages::default();
+            // `0xa5` is the alternating bit pattern, which makes incorrect accesses obvious.
             insert_one_page_worth_fixed_len(&mut pages, visitor, &R::from_u64(0xa5a5a5a5_a5a5a5a5));
             let pre = |_, pages: &mut Pages| pages.clear();
             iter_time_with(b, &mut pages, pre, |_, _, pages| {
@@ -485,12 +464,14 @@ criterion_group!(
 );
 
 fn schema_from_ty(ty: ProductType, name: &str) -> TableSchema {
-    TableSchema::from_def(TableId(0), TableDef::from_product(name, ty))
+    let mut result = TableSchema::from_product_type(ty);
+    result.table_name = name.into();
+    result
 }
 
 fn make_table(c: &mut Criterion) {
     fn bench_make_table<R: Row>(group: Group<'_, '_>, name: &str) {
-        let ty = R::row_type();
+        let ty = R::row_type_for_schema();
         let schema = schema_from_ty(ty.clone(), name);
         group.bench_function(name, |b| {
             b.iter_custom(|num_iters| {
@@ -498,7 +479,7 @@ fn make_table(c: &mut Criterion) {
                 let mut tables = Vec::with_capacity(num_iters as usize);
                 let start = WallTime.start();
                 for schema in schemas {
-                    tables.push(Table::new(schema, SquashedOffset::COMMITTED_STATE));
+                    tables.push(Table::new(schema.into(), SquashedOffset::COMMITTED_STATE));
                 }
                 let elapsed = WallTime.end(start);
                 black_box(tables);
@@ -515,9 +496,9 @@ fn make_table(c: &mut Criterion) {
 }
 
 fn make_table_for_row_type<R: Row>(name: &str) -> Table {
-    let ty = R::row_type();
+    let ty = R::row_type_for_schema();
     let schema = schema_from_ty(ty.clone(), name);
-    Table::new(schema, SquashedOffset::COMMITTED_STATE)
+    Table::new(schema.into(), SquashedOffset::COMMITTED_STATE)
 }
 
 fn use_type_throughput<T>(group: &mut BenchmarkGroup<'_, impl Measurement>) {
@@ -526,16 +507,19 @@ fn use_type_throughput<T>(group: &mut BenchmarkGroup<'_, impl Measurement>) {
 
 fn table_insert_one_row(c: &mut Criterion) {
     fn bench_insert_row<R: Row>(group: Group<'_, '_>, val: R, name: &str) {
-        let mut table = make_table_for_row_type::<R>(name);
+        let table = make_table_for_row_type::<R>(name);
         let val = black_box(val.to_product());
 
         // Insert before benching to alloc and fault in a page.
-        let ptr = table.insert(&mut NullBlobStore, &val).unwrap().1;
-        let pre = |_, table: &mut Table| {
-            table.delete(&mut NullBlobStore, ptr).unwrap();
+        let mut ctx = (table, NullBlobStore);
+        let ptr = ctx.0.insert(&mut ctx.1, &val).unwrap().1.pointer();
+        let pre = |_, (table, bs): &mut (Table, NullBlobStore)| {
+            table.delete(bs, ptr, |_| ()).unwrap();
         };
         group.bench_function(name, |b| {
-            iter_time_with(b, &mut table, pre, |_, _, table| table.insert(&mut NullBlobStore, &val));
+            iter_time_with(b, &mut ctx, pre, |_, _, (table, bs)| {
+                table.insert(bs, &val).map(|r| r.1.pointer())
+            });
         });
     }
 
@@ -555,30 +539,33 @@ fn table_insert_one_row(c: &mut Criterion) {
     let mut group = c.benchmark_group("table_insert_one_row/String");
 
     group.throughput(Throughput::Elements(1));
-    bench_insert_row(&mut group, "".to_string(), "0");
+    bench_insert_row(&mut group, Box::from(""), "0");
 
     group.throughput(Throughput::Bytes(1));
-    bench_insert_row(&mut group, "a".to_string(), "1");
+    bench_insert_row(&mut group, Box::from("a"), "1");
 
     for num_granules in [1, 2, 4, 8, 16] {
         let num_bytes = VarLenGranule::DATA_SIZE * num_granules;
         group.throughput(Throughput::Bytes(num_bytes as u64));
-        bench_insert_row(&mut group, "a".repeat(num_bytes), &num_bytes.to_string());
+        bench_insert_row(
+            &mut group,
+            "a".repeat(num_bytes).into_boxed_str(),
+            &num_bytes.to_string(),
+        );
     }
 }
 
 fn table_delete_one_row(c: &mut Criterion) {
     fn bench_delete_row<R: Row>(group: Group<'_, '_>, val: R, name: &str) {
-        let mut table = make_table_for_row_type::<R>(name);
+        let table = make_table_for_row_type::<R>(name);
         let val = val.to_product();
 
         // Insert before benching to alloc and fault in a page.
-        let insert = |_, table: &mut Table| table.insert(&mut NullBlobStore, &val).unwrap().1;
+        let mut ctx = (table, NullBlobStore);
+        let insert = |_: u64, (table, bs): &mut (Table, NullBlobStore)| table.insert(bs, &val).unwrap().1.pointer();
 
         group.bench_function(name, |b| {
-            iter_time_with(b, &mut table, insert, |ptr, _, table| {
-                table.delete(&mut NullBlobStore, ptr)
-            });
+            iter_time_with(b, &mut ctx, insert, |row, _, (table, bs)| table.delete(bs, row, |_| ()));
         });
     }
 
@@ -598,15 +585,19 @@ fn table_delete_one_row(c: &mut Criterion) {
     let mut group = c.benchmark_group("table_delete_one_row/String");
 
     group.throughput(Throughput::Elements(1));
-    bench_delete_row(&mut group, "".to_string(), "0");
+    bench_delete_row(&mut group, Box::from(""), "0");
 
     group.throughput(Throughput::Bytes(1));
-    bench_delete_row(&mut group, "a".to_string(), "1");
+    bench_delete_row(&mut group, Box::from("a"), "1");
 
     for num_granules in [1, 2, 4, 8, 16] {
         let num_bytes = VarLenGranule::DATA_SIZE * num_granules;
         group.throughput(Throughput::Bytes(num_bytes as u64));
-        bench_delete_row(&mut group, "a".repeat(num_bytes), &num_bytes.to_string());
+        bench_delete_row(
+            &mut group,
+            "a".repeat(num_bytes).into_boxed_str(),
+            &num_bytes.to_string(),
+        );
     }
 }
 
@@ -615,16 +606,10 @@ fn table_extract_one_row(c: &mut Criterion) {
         let mut table = make_table_for_row_type::<R>(name);
         let val = val.to_product();
 
-        let ptr = table.insert(&mut NullBlobStore, &val).unwrap().1;
+        let mut blob_store = NullBlobStore;
+        let row = black_box(table.insert(&mut blob_store, &val).unwrap().1);
         group.bench_function(name, |b| {
-            b.iter_with_large_drop(|| {
-                black_box(
-                    black_box(&table)
-                        .get_row_ref(&NullBlobStore, black_box(ptr))
-                        .unwrap()
-                        .to_product_value(),
-                )
-            });
+            b.iter_with_large_drop(|| black_box(row.to_product_value()));
         });
     }
 
@@ -644,15 +629,19 @@ fn table_extract_one_row(c: &mut Criterion) {
     let mut group = c.benchmark_group("table_extract_one_row/String");
 
     group.throughput(Throughput::Elements(1));
-    bench_extract_row(&mut group, "".to_string(), "0");
+    bench_extract_row(&mut group, Box::from(""), "0");
 
     group.throughput(Throughput::Bytes(1));
-    bench_extract_row(&mut group, "a".to_string(), "1");
+    bench_extract_row(&mut group, Box::from("a"), "1");
 
     for num_granules in [1, 2, 4, 8, 16] {
         let num_bytes = VarLenGranule::DATA_SIZE * num_granules;
         group.throughput(Throughput::Bytes(num_bytes as u64));
-        bench_extract_row(&mut group, "a".repeat(num_bytes), &num_bytes.to_string());
+        bench_extract_row(
+            &mut group,
+            "a".repeat(num_bytes).into_boxed_str(),
+            &num_bytes.to_string(),
+        );
     }
 }
 
@@ -676,12 +665,26 @@ trait IndexedRow: Row + Sized {
     fn indexed_columns() -> ColList {
         0.into()
     }
-    fn make_table_def() -> TableDef {
-        TableDef::from_product(std::any::type_name::<Self>(), Self::row_type())
-            .with_column_index(Self::indexed_columns(), false)
+    fn table_name() -> String {
+        std::any::type_name::<Self>()
+            .chars()
+            .filter(|c| c.is_alphabetic())
+            .collect()
     }
+    /// Don't call this in a loop, it runs validation code.
     fn make_schema() -> TableSchema {
-        TableSchema::from_def(TableId(0), Self::make_table_def())
+        let name = Self::table_name();
+        let mut builder = RawModuleDefV9Builder::new();
+        builder
+            .build_table_with_new_type(name.clone(), Self::row_type_for_schema(), true)
+            .with_index(
+                RawIndexAlgorithm::BTree {
+                    columns: Self::indexed_columns(),
+                },
+                "accessor_name_doesnt_matter",
+            );
+        let def: ModuleDef = builder.finish().try_into().expect("failed to build table schema");
+        def.table_schema(&name[..], TableId::SENTINEL).unwrap()
     }
     fn throughput() -> Throughput {
         Throughput::Bytes(mem::size_of::<Self>() as u64)
@@ -707,9 +710,9 @@ impl IndexedRow for U32x64 {
     }
 }
 
-impl IndexedRow for String {
+impl IndexedRow for Box<str> {
     fn column_value_from_u64(u: u64) -> AlgebraicValue {
-        AlgebraicValue::String(u.to_string())
+        AlgebraicValue::String(u.to_string().into())
     }
     fn throughput() -> Throughput {
         // I'm too lazy to come up with an interface that computes the length of a string
@@ -718,15 +721,17 @@ impl IndexedRow for String {
     }
 }
 
-fn make_table_with_indexes<R: IndexedRow>() -> Table {
+fn make_table_with_index<R: IndexedRow>(unique: bool) -> (Table, IndexId) {
     let schema = R::make_schema();
-    let mut tbl = Table::new(schema, SquashedOffset::COMMITTED_STATE);
+    let mut tbl = Table::new(schema.into(), SquashedOffset::COMMITTED_STATE);
 
     let cols = R::indexed_columns();
-    let idx = BTreeIndex::new(IndexId(0), &R::row_type().into(), &cols, false, "idx").unwrap();
-    tbl.insert_index(&NullBlobStore, cols, idx);
+    let index_id = IndexId::SENTINEL;
+    let idx = tbl.new_index(cols, unique).unwrap();
+    // SAFETY: index was derived from the table.
+    unsafe { tbl.insert_index(&NullBlobStore, index_id, idx) };
 
-    tbl
+    (tbl, index_id)
 }
 
 #[cfg(not(debug_assertions))]
@@ -750,31 +755,27 @@ fn insert_num_same<R: IndexedRow>(
             if let Some(slot) = row.elements.get_mut(1) {
                 *slot = n.into();
             }
-            tbl.insert(&mut NullBlobStore, &row).map(|(_, ptr)| ptr).ok()
+            tbl.insert(&mut NullBlobStore, &row).map(|(_, row)| row.pointer()).ok()
         })
         .last()
         .flatten()
 }
 
-fn clear_all_same<R: IndexedRow>(tbl: &mut Table, val_same: u64) {
+fn clear_all_same<R: IndexedRow>(tbl: &mut Table, index_id: IndexId, val_same: u64) {
     let ptrs = tbl
-        .index_seek(
-            &NullBlobStore,
-            &R::indexed_columns(),
-            &R::column_value_from_u64(val_same),
-        )
+        .get_index_by_id(index_id)
         .unwrap()
-        .map(|r| r.pointer())
+        .seek(&R::column_value_from_u64(val_same))
         .collect::<Vec<_>>();
     for ptr in ptrs {
-        tbl.delete(&mut NullBlobStore, ptr).unwrap();
+        tbl.delete(&mut NullBlobStore, ptr, |_| ()).unwrap();
     }
 }
 
-fn bench_id_for_index(name: &str, num_rows: u64, same_ratio: f64, num_same: usize) -> BenchmarkId {
+fn bench_id_for_index(name: &str, num_rows: u64, same_ratio: f64, num_same: usize, unique: bool) -> BenchmarkId {
     BenchmarkId::new(
         name,
-        format_args!("(rows = {num_rows}, sratio = {same_ratio}, snum = {num_same})"),
+        format_args!("(rows = {num_rows}, sratio = {same_ratio}, snum = {num_same}, unique = {unique})"),
     )
 }
 
@@ -782,18 +783,23 @@ fn make_table_with_same_ratio<R: IndexedRow>(
     mut make_row: impl FnMut(u64) -> R,
     num_rows: u64,
     same_ratio: f64,
-) -> (Table, usize, u64) {
-    let mut tbl = make_table_with_indexes::<R>();
+    unique: bool,
+) -> (Table, IndexId, usize, u64) {
+    let (mut tbl, index_id) = make_table_with_index::<R>(unique);
 
-    let num_same = (num_rows as f64 * same_ratio) as usize;
-    let num_same = num_same.max(1);
+    let num_same = if unique {
+        1
+    } else {
+        let num_same = (num_rows as f64 * same_ratio) as usize;
+        num_same.max(1)
+    };
     let num_diff = num_rows / num_same as u64;
 
     for i in 0..num_diff {
         insert_num_same(&mut tbl, || make_row(i), num_same);
     }
 
-    (tbl, num_same, num_diff)
+    (tbl, index_id, num_same, num_diff)
 }
 
 fn index_insert(c: &mut Criterion) {
@@ -805,18 +811,21 @@ fn index_insert(c: &mut Criterion) {
         same_ratio: f64,
     ) {
         let make_row_move = &mut make_row;
-        let (mut tbl, num_same, _) = make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio);
+        let (tbl, index_id, num_same, _) = make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio, false);
+        let mut ctx = (tbl, NullBlobStore);
 
         group.bench_with_input(
-            bench_id_for_index(name, num_rows, same_ratio, num_same),
+            bench_id_for_index(name, num_rows, same_ratio, num_same, false),
             &num_rows,
             |b, &num_rows| {
-                let pre = |_, tbl: &mut Table| {
-                    clear_all_same::<R>(tbl, num_rows);
+                let pre = |_, (tbl, _): &mut (Table, NullBlobStore)| {
+                    clear_all_same::<R>(tbl, index_id, num_rows);
                     insert_num_same(tbl, || make_row(num_rows), num_same - 1);
                     make_row(num_rows).to_product()
                 };
-                iter_time_with(b, &mut tbl, pre, |row, _, tbl| tbl.insert(&mut NullBlobStore, &row));
+                iter_time_with(b, &mut ctx, pre, |row, _, (tbl, bs)| {
+                    tbl.insert(bs, &row).map(|r| r.1.pointer())
+                });
             },
         );
     }
@@ -843,7 +852,7 @@ fn index_insert(c: &mut Criterion) {
     bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.50);
     bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 1.00);
     bench_many_table_sizes::<U32x64>(FixedLenRow::from_u64, &mut group, "U32x64", 0.0);
-    bench_many_table_sizes::<String>(|i| i.to_string(), &mut group, "String", 0.0);
+    bench_many_table_sizes::<Box<str>>(|i| i.to_string().into(), &mut group, "String", 0.0);
 }
 
 fn index_seek(c: &mut Criterion) {
@@ -853,23 +862,25 @@ fn index_seek(c: &mut Criterion) {
         name: &str,
         num_rows: u64,
         same_ratio: f64,
+        unique: bool,
     ) {
         let make_row_move = &mut make_row;
-        let (tbl, num_same, num_diff) = make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio);
+        let (tbl, index_id, num_same, num_diff) =
+            make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio, unique);
 
         group.bench_with_input(
-            bench_id_for_index(name, num_rows, same_ratio, num_same),
+            bench_id_for_index(name, num_rows, same_ratio, num_same, unique),
             &num_diff,
             |b, &num_diff| {
                 let col_to_seek = black_box(R::column_value_from_u64(num_diff / 2));
-                let col_ids = black_box(R::indexed_columns());
+                let index = black_box(&tbl)
+                    .get_index_by_id_with_table(&NullBlobStore, index_id)
+                    .unwrap();
                 b.iter_custom(|num_iters| {
                     let mut elapsed = WallTime.zero();
                     for _ in 0..num_iters {
                         let (row, none) = time(&mut elapsed, || {
-                            let mut iter = black_box(&tbl)
-                                .index_seek(&NullBlobStore, &col_ids, &col_to_seek)
-                                .unwrap();
+                            let mut iter = index.seek(&col_to_seek);
                             (iter.next(), iter.next())
                         });
                         assert!(
@@ -890,25 +901,27 @@ fn index_seek(c: &mut Criterion) {
         group: Group<'_, '_>,
         name: &str,
         same_ratio: f64,
+        unique: bool,
     ) {
         group.throughput(Throughput::Elements(1));
         for num_rows in powers(TABLE_SIZE_POWERS) {
-            bench_index_seek(&mut make_row, group, name, num_rows, same_ratio);
+            bench_index_seek(&mut make_row, group, name, num_rows, same_ratio, unique);
         }
     }
 
     let mut group = c.benchmark_group("index_seek");
 
-    bench_many_table_sizes::<u64>(FixedLenRow::from_u64, &mut group, "u64", 0.0);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.00);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.01);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.05);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.10);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.25);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.50);
-    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 1.00);
-    bench_many_table_sizes::<U32x64>(FixedLenRow::from_u64, &mut group, "U32x64", 0.0);
-    bench_many_table_sizes::<String>(|i| i.to_string(), &mut group, "String", 0.0);
+    bench_many_table_sizes::<u64>(FixedLenRow::from_u64, &mut group, "u64", 0.0, false);
+    bench_many_table_sizes::<u64>(FixedLenRow::from_u64, &mut group, "u64", 0.0, true);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.00, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.01, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.05, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.10, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.25, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.50, false);
+    bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 1.00, false);
+    bench_many_table_sizes::<U32x64>(FixedLenRow::from_u64, &mut group, "U32x64", 0.0, false);
+    bench_many_table_sizes::<Box<str>>(|i| i.to_string().into(), &mut group, "String", 0.0, false);
 }
 
 fn index_delete(c: &mut Criterion) {
@@ -920,17 +933,20 @@ fn index_delete(c: &mut Criterion) {
         same_ratio: f64,
     ) {
         let make_row_move = &mut make_row;
-        let (mut tbl, num_same, _) = make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio);
+        let (mut tbl, index_id, num_same, _) =
+            make_table_with_same_ratio::<R>(make_row_move, num_rows, same_ratio, false);
 
         group.bench_with_input(
-            bench_id_for_index(name, num_rows, same_ratio, num_same),
+            bench_id_for_index(name, num_rows, same_ratio, num_same, false),
             &num_rows,
             |b, &num_rows| {
                 let pre = |_, tbl: &mut Table| {
-                    clear_all_same::<R>(tbl, num_rows);
+                    clear_all_same::<R>(tbl, index_id, num_rows);
                     insert_num_same(tbl, || make_row(num_rows), num_same).unwrap()
                 };
-                iter_time_with(b, &mut tbl, pre, |ptr, _, tbl| tbl.delete(&mut NullBlobStore, ptr));
+                iter_time_with(b, &mut tbl, pre, |ptr, _, tbl| {
+                    tbl.delete(&mut NullBlobStore, ptr, |_| ())
+                });
             },
         );
     }
@@ -957,7 +973,7 @@ fn index_delete(c: &mut Criterion) {
     bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 0.50);
     bench_many_table_sizes::<U32x8>(FixedLenRow::from_u64, &mut group, "U32x8", 1.00);
     bench_many_table_sizes::<U32x64>(FixedLenRow::from_u64, &mut group, "U32x64", 0.0);
-    bench_many_table_sizes::<String>(|i| i.to_string(), &mut group, "String", 0.0);
+    bench_many_table_sizes::<Box<str>>(|i| i.to_string().into(), &mut group, "String", 0.0);
 }
 
 criterion_group!(index, index_insert, index_seek, index_delete);

@@ -1,64 +1,51 @@
-using SpacetimeDB.Module;
-using static SpacetimeDB.Runtime;
+namespace SpacetimeDB.Examples.QuickStart.Server;
+
+using SpacetimeDB;
+
+[Table(Name = "person", Public = true)]
+public partial struct Person
+{
+    [AutoInc]
+    [PrimaryKey]
+    public uint id;
+    public string name;
+
+    [Index.BTree]
+    public byte age;
+}
 
 static partial class Module
 {
-    [SpacetimeDB.Table]
-    public partial struct Person
+    [SpacetimeDB.Reducer]
+    public static void add(ReducerContext ctx, string name, byte age)
     {
-        [SpacetimeDB.Column(ColumnAttrs.PrimaryKeyAuto)]
-        public uint Id;
-        public string Name;
-        public byte Age;
+        ctx.Db.person.Insert(new Person { name = name, age = age });
     }
 
-    // Verify that all types compile via codegen successfully.
-    // TODO: port actual SDK tests from Rust.
-    [SpacetimeDB.Table]
-    public partial struct Typecheck
+    [SpacetimeDB.Reducer]
+    public static void say_hello(ReducerContext ctx)
     {
-        bool BoolField;
-        byte ByteField;
-        sbyte SbyteField;
-        short ShortField;
-        ushort UshortField;
-        int IntField;
-        uint UintField;
-        long LongField;
-        ulong UlongField;
-        float FloatField;
-        double DoubleField;
-        string StringField;
-        Int128 Int128Field;
-        UInt128 Uint128Field;
-        Person NestedTableField;
-        Person[] NestedTableArrayField;
-        List<Person> NestedTableListField;
-        Dictionary<string, Person> NestedTableDictionaryField;
-    }
-
-    [SpacetimeDB.Reducer("add")]
-    public static void Add(string name, byte age)
-    {
-        new Person { Name = name, Age = age }.Insert();
-    }
-
-    [SpacetimeDB.Reducer("say_hello")]
-    public static void SayHello()
-    {
-        foreach (var person in Person.Iter())
+        foreach (var person in ctx.Db.person.Iter())
         {
-            Log($"Hello, {person.Name}!");
+            Log.Info($"Hello, {person.name}!");
         }
-        Log("Hello, World!");
+        Log.Info("Hello, World!");
     }
 
-    [SpacetimeDB.Reducer("list_over_age")]
-    public static void ListOverAge(byte age)
+    [SpacetimeDB.Reducer]
+    public static void list_over_age(ReducerContext ctx, byte age)
     {
-        foreach (var person in Person.Query(person => person.Age >= age))
+        foreach (var person in ctx.Db.person.age.Filter((age, byte.MaxValue)))
         {
-            Log($"{person.Name} has age {person.Age} >= {age}");
+            Log.Info($"{person.name} has age {person.age} >= {age}");
         }
+    }
+
+    [SpacetimeDB.Reducer]
+    public static void log_module_identity(ReducerContext ctx)
+    {
+        // Note: we use ToLower() because Rust side stringifies identities as lowercase hex.
+        // Is this something we need to align on in the future?
+        Log.Info($"Module identity: {ctx.Identity.ToString().ToLower()}");
     }
 }

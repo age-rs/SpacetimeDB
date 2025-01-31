@@ -3,36 +3,39 @@ use core::slice;
 use smallvec::SmallVec;
 use std::collections::btree_map::{BTreeMap, Range};
 
+use crate::MemoryUsage;
+
 /// A multi map that relates a `K` to a *set* of `V`s.
-#[derive(Default)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct MultiMap<K, V> {
     /// The map is backed by a `BTreeMap` for relating keys to values.
     ///
-    /// A value set is stored as a *sorted* `SmallVec`.
-    /// This is an optimization over a sorted `Vec<_>`
+    /// A value set is stored as a `SmallVec`.
+    /// This is an optimization over a `Vec<_>`
     /// as we allow a single element to be stored inline
     /// to improve performance for the common case of one element.
     map: BTreeMap<K, SmallVec<[V; 1]>>,
 }
 
-impl<K: Ord, V: Ord> MultiMap<K, V> {
-    /// Returns an empty multi map.
-    pub fn new() -> Self {
+impl<K, V> Default for MultiMap<K, V> {
+    fn default() -> Self {
         Self { map: BTreeMap::new() }
     }
+}
 
+impl<K: MemoryUsage, V: MemoryUsage> MemoryUsage for MultiMap<K, V> {
+    fn heap_usage(&self) -> usize {
+        let Self { map } = self;
+        map.heap_usage()
+    }
+}
+
+impl<K: Ord, V: Ord> MultiMap<K, V> {
     /// Inserts the relation `key -> val` to this multimap.
     ///
-    /// Returns false if `key -> val` was already in the map.
-    pub fn insert(&mut self, key: K, val: V) -> bool {
-        let vset = self.map.entry(key).or_default();
-        // Use binary search to maintain the sort order.
-        // This is used to determine in `O(log(vset.len()))` whether `val` was already present.
-        let Err(idx) = vset.binary_search(&val) else {
-            return false;
-        };
-        vset.insert(idx, val);
-        true
+    /// The map does not check whether `key -> val` was already in the map.
+    pub fn insert(&mut self, key: K, val: V) {
+        self.map.entry(key).or_default().push(val);
     }
 
     /// Deletes `key -> val` from this multimap.
@@ -40,10 +43,9 @@ impl<K: Ord, V: Ord> MultiMap<K, V> {
     /// Returns whether `key -> val` was present.
     pub fn delete(&mut self, key: &K, val: &V) -> bool {
         if let Some(vset) = self.map.get_mut(key) {
-            // The `vset` is sorted so we can binary search.
-            if let Ok(idx) = vset.binary_search(val) {
-                // Maintain the sorted order. Don't use `swap_remove`!
-                vset.remove(idx);
+            // The `vset` is not sorted, so we have to do a linear scan first.
+            if let Some(idx) = vset.iter().position(|v| v == val) {
+                vset.swap_remove(idx);
                 return true;
             }
         }
@@ -57,6 +59,11 @@ impl<K: Ord, V: Ord> MultiMap<K, V> {
             outer: self.map.range((range.start_bound(), range.end_bound())),
             inner: None,
         }
+    }
+
+    /// Returns the number of unique keys in the multimap.
+    pub fn num_keys(&self) -> usize {
+        self.map.len()
     }
 
     /// Returns the total number of entries in the multimap.

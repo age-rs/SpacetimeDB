@@ -21,6 +21,10 @@ harness = false
 name = "subscription"
 harness = false
 
+[[bench]]
+name = "delete_table"
+harness = false
+
 [[bin]]
 name = "summarize"
 
@@ -28,15 +32,20 @@ name = "summarize"
 bench = false
 
 [dependencies]
-spacetimedb-lib = { path = "../lib" }
-spacetimedb-core = { path = "../core" }
-spacetimedb-sats = { path = "../sats" }
-spacetimedb-standalone = { path = "../standalone" }
 spacetimedb-client-api = { path = "../client-api" }
-spacetimedb-testing = { path = "../testing" }
+spacetimedb-core = { path = "../core", features = ["test"] }
+spacetimedb-data-structures.workspace = true
+spacetimedb-execution = { path = "../execution" }
+spacetimedb-lib = { path = "../lib" }
+spacetimedb-paths.workspace = true
 spacetimedb-primitives = { path = "../primitives" }
+spacetimedb-query = { path = "../query" }
+spacetimedb-sats = { path = "../sats" }
+spacetimedb-schema = { workspace = true, features = ["test"] }
+spacetimedb-standalone = { path = "../standalone" }
+spacetimedb-table = { path = "../table" }
+spacetimedb-testing = { path = "../testing" }
 
-ahash.workspace = true
 anyhow.workspace = true
 anymap.workspace = true
 byte-unit.workspace = true
@@ -51,11 +60,14 @@ regex.workspace = true
 rusqlite.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+serial_test.workspace = true
+smallvec.workspace = true
 tempdir.workspace = true
 tokio.workspace = true
 tracing-subscriber.workspace = true
 walkdir.workspace = true
 itertools.workspace = true
+foldhash = "0.1.4"
 
 [target.'cfg(target_os = "linux")'.dependencies]
 # only try to build these on linux

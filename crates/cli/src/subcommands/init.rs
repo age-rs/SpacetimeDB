@@ -1,3 +1,4 @@
+use crate::detect::find_executable;
 use crate::util::ModuleLanguage;
 use crate::Config;
 use anyhow::Context;
@@ -36,7 +37,7 @@ fn check_for_cargo() -> bool {
             if find_executable("cargo.exe").is_some() {
                 return true;
             }
-            println!("{}", "Warning: You have created a rust project, but you are missing cargo. Visit the rust-lang official website for the latest instructions on install cargo on Windows:\n\n\tYou have created a rust project, but you are missing cargo.\n".yellow());
+            println!("{}", "Warning: You have created a rust project, but you are missing `cargo`. Visit https://www.rust-lang.org/tools/install for installation instructions:\n\n\tYou have created a rust project, but you are missing cargo.\n".yellow());
         }
         unsupported_os => {
             println!("{}", format!("This OS may be unsupported: {}", unsupported_os).yellow());
@@ -112,7 +113,7 @@ fn check_for_git() -> bool {
     false
 }
 
-pub async fn exec(_: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
+pub async fn exec(_config: Config, args: &ArgMatches) -> Result<(), anyhow::Error> {
     let project_path = args.get_one::<PathBuf>("project-path").unwrap();
     let project_lang = *args.get_one::<ModuleLanguage>("lang").unwrap();
 
@@ -177,6 +178,7 @@ pub async fn exec_init_csharp(args: &ArgMatches) -> anyhow::Result<()> {
         (include_str!("project/csharp/StdbModule._csproj"), "StdbModule.csproj"),
         (include_str!("project/csharp/Lib._cs"), "Lib.cs"),
         (include_str!("project/csharp/_gitignore"), ".gitignore"),
+        (include_str!("project/csharp/global._json"), "global.json"),
     ];
 
     // Check all dependencies
@@ -201,15 +203,4 @@ pub async fn exec_init_csharp(args: &ArgMatches) -> anyhow::Result<()> {
 
 fn create_directory(path: &Path) -> Result<(), anyhow::Error> {
     std::fs::create_dir_all(path).context("Failed to create directory")
-}
-
-fn find_executable(exe_name: impl AsRef<Path>) -> Option<std::path::PathBuf> {
-    std::env::var_os("PATH").and_then(|paths| {
-        std::env::split_paths(&paths)
-            .filter_map(|dir| {
-                let full_path = dir.join(&exe_name);
-                full_path.is_file().then_some(full_path)
-            })
-            .next()
-    })
 }
