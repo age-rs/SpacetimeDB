@@ -1,13 +1,17 @@
 //! Provides [`Pages`], a page manager dealing with [`Page`]s as a collection.
 
+use crate::MemoryUsage;
+
 use super::blob_store::BlobStore;
 use super::indexes::{Bytes, PageIndex, PageOffset, RowPointer, Size};
 use super::page::Page;
+use super::table::BlobNumBytes;
 use super::var_len::VarLenMembers;
 use core::ops::{ControlFlow, Deref, Index, IndexMut};
+use std::ops::DerefMut;
 use thiserror::Error;
 
-#[derive(Error, Debug)]
+#[derive(Error, Debug, PartialEq, Eq)]
 pub enum Error {
     #[error("Attempt to allocate more than {} pages.", PageIndex::MAX.idx())]
     TooManyPages,
@@ -30,12 +34,19 @@ impl IndexMut<PageIndex> for Pages {
 }
 
 /// A manager of [`Page`]s.
-#[derive(Default)]
+#[derive(Default, Debug, PartialEq, Eq)]
 pub struct Pages {
     /// The collection of pages under management.
     pages: Vec<Box<Page>>,
     /// The set of pages that aren't yet full.
     non_full_pages: Vec<PageIndex>,
+}
+
+impl MemoryUsage for Pages {
+    fn heap_usage(&self) -> usize {
+        let Self { pages, non_full_pages } = self;
+        pages.heap_usage() + non_full_pages.heap_usage()
+    }
 }
 
 impl Pages {
@@ -53,7 +64,6 @@ impl Pages {
     ///
     /// Used in benchmarks. Internal operators will prefer directly indexing into `self.pages`,
     /// as that allows split borrows.
-    #[doc(hidden)] // Used in benchmarks.
     pub fn get_page_mut(&mut self, page: PageIndex) -> &mut Page {
         &mut self.pages[page.idx()]
     }
@@ -215,7 +225,7 @@ impl Pages {
         fixed_row_size: Size,
         row_ptr: RowPointer,
         blob_store: &mut dyn BlobStore,
-    ) {
+    ) -> BlobNumBytes {
         let page = &mut self[row_ptr.page_index()];
         let full_before = page.is_full(fixed_row_size);
         // SAFETY:
@@ -224,15 +234,15 @@ impl Pages {
         //
         // - `fixed_row_size` is consistent with the size in bytes of the fixed part of the row.
         //   The size is also conistent with `var_len_visitor`.
-        unsafe {
-            page.delete_row(row_ptr.page_offset(), fixed_row_size, var_len_visitor, blob_store);
-        }
+        let blob_store_deleted_bytes =
+            unsafe { page.delete_row(row_ptr.page_offset(), fixed_row_size, var_len_visitor, blob_store) };
 
         // If the page was previously full, mark it as non-full now,
         // since we just opened a space in it.
         if full_before {
             self.mark_page_non_full(row_ptr.page_index());
         }
+        blob_store_deleted_bytes
     }
 
     /// Materialize a view of rows in `self` for which the  `filter` returns `true`.
@@ -326,6 +336,26 @@ impl Pages {
 
         partial_copied_pages
     }
+
+    /// Set this [`Pages`]' contents to be the `pages`.
+    ///
+    /// Used when restoring from a snapshot.
+    ///
+    /// Each page in the `pages` must be consistent with the schema for this [`Pages`],
+    /// i.e. the schema for the [`crate::table::Table`] which contains `self`.
+    ///
+    /// Should only ever be called when `self.is_empty()`.
+    ///
+    /// Also populates `self.non_full_pages`.
+    pub fn set_contents(&mut self, pages: Vec<Box<Page>>, fixed_row_size: Size) {
+        debug_assert!(self.is_empty());
+        self.non_full_pages = pages
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, page)| (!page.is_full(fixed_row_size)).then_some(PageIndex(idx as _)))
+            .collect();
+        self.pages = pages;
+    }
 }
 
 impl Deref for Pages {
@@ -333,5 +363,11 @@ impl Deref for Pages {
 
     fn deref(&self) -> &Self::Target {
         &self.pages
+    }
+}
+
+impl DerefMut for Pages {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.pages
     }
 }

@@ -16,6 +16,8 @@ jobs:
     steps:
       - name: Install jq
         run: sudo apt-get install jq -y
+      - name: Prune stale references
+        run: git remote prune origin
       - name: Checkout
         uses: actions/checkout@v3
       - name: Docker meta
@@ -25,16 +27,14 @@ jobs:
           images: |
             clockworklabs/spacetimedb
           tags: |
-            type=ref,event=branch,prefix=branch-
-            type=sha,prefix=commit-
             type=ref,event=tag
-            type=sha,suffix=-amd64
+            type=sha,prefix=commit-,suffix=-amd64
           flavor: |
             latest=false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
       - name: Cache Docker layers
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ github.sha }}
@@ -77,6 +77,8 @@ jobs:
     steps:
       - name: Install jq
         run: sudo apt-get install jq -y
+      - name: Prune stale references
+        run: git remote prune origin
       - name: Checkout
         uses: actions/checkout@v3
       - name: Docker meta
@@ -86,16 +88,14 @@ jobs:
           images: |
             clockworklabs/spacetimedb
           tags: |
-            type=ref,event=branch,prefix=branch-
-            type=sha,prefix=commit-
             type=ref,event=tag
-            type=sha,suffix=-arm64
+            type=sha,prefix=commit-,suffix=-arm64
           flavor: |
             latest=false
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v2
       - name: Cache Docker layers
-        uses: actions/cache@v2
+        uses: actions/cache@v4
         with:
           path: /tmp/.buildx-cache
           key: ${{ runner.os }}-buildx-${{ github.sha }}
