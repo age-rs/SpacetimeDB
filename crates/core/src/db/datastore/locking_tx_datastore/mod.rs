@@ -1,14 +1,15 @@
-#![forbid(unsafe_op_in_unsafe_fn)]
+#![deny(unsafe_op_in_unsafe_fn)]
 
-pub(crate) mod committed_state;
+pub mod committed_state;
 pub mod datastore;
-pub(crate) mod mut_tx;
+mod mut_tx;
 pub use mut_tx::MutTxId;
-pub(crate) mod sequence;
-pub(crate) mod state_view;
-pub use state_view::{Iter, IterByColEq, IterByColRange};
+mod sequence;
+pub mod state_view;
+pub use state_view::{IterByColEqTx, IterByColRangeTx};
+pub mod delete_table;
 pub(crate) mod tx;
-pub(crate) mod tx_state;
+mod tx_state;
 
 use parking_lot::{
     lock_api::{ArcMutexGuard, ArcRwLockReadGuard, ArcRwLockWriteGuard},

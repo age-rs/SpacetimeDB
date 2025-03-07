@@ -5,14 +5,13 @@ mod impls;
 #[cfg(feature = "serde")]
 pub mod serde;
 
-use std::fmt;
+use core::fmt;
 
-/// A **data format** that can deserialize any data structure supported by SATs.
+/// A data format that can deserialize any data structure supported by SATs.
 ///
-/// The `Serializer` trait in SATS performs the same function as [`serde::Serializer`] in [`serde`].
-/// See the documentation of [`serde::Serializer`] for more information of the data model.
+/// The `Serializer` trait in SATS performs the same function as `serde::Serializer` in [`serde`].
+/// See the documentation of `serde::Serializer` for more information on the data model.
 ///
-/// [`serde::Serializer`]: ::serde::Serializer
 /// [`serde`]: https://crates.io/crates/serde
 pub trait Serializer: Sized {
     /// The output type produced by this `Serializer` during successful serialization.
@@ -31,10 +30,6 @@ pub trait Serializer: Sized {
     /// Type returned from [`serialize_array`](Serializer::serialize_array)
     /// for serializing the contents of the array.
     type SerializeArray: SerializeArray<Ok = Self::Ok, Error = Self::Error>;
-
-    /// Type returned from [`serialize_map`](Serializer::serialize_map)
-    /// for serializing the contents of the map.
-    type SerializeMap: SerializeMap<Ok = Self::Ok, Error = Self::Error>;
 
     /// Type returned from [`serialize_seq_product`](Serializer::serialize_seq_product)
     /// for serializing the contents of the *unnamed* product.
@@ -62,6 +57,9 @@ pub trait Serializer: Sized {
     /// Serialize a `u128` value.
     fn serialize_u128(self, v: u128) -> Result<Self::Ok, Self::Error>;
 
+    /// Serialize a `u256` value.
+    fn serialize_u256(self, v: u256) -> Result<Self::Ok, Self::Error>;
+
     /// Serialize an `i8` value.
     fn serialize_i8(self, v: i8) -> Result<Self::Ok, Self::Error>;
 
@@ -76,6 +74,9 @@ pub trait Serializer: Sized {
 
     /// Serialize an `i128` value.
     fn serialize_i128(self, v: i128) -> Result<Self::Ok, Self::Error>;
+
+    /// Serialize an `i256` value.
+    fn serialize_i256(self, v: i256) -> Result<Self::Ok, Self::Error>;
 
     /// Serialize an `f32` value.
     fn serialize_f32(self, v: f32) -> Result<Self::Ok, Self::Error>;
@@ -95,13 +96,6 @@ pub trait Serializer: Sized {
     ///
     /// The argument is the number of elements in the sequence.
     fn serialize_array(self, len: usize) -> Result<Self::SerializeArray, Self::Error>;
-
-    /// Begin to serialize a variably sized map.
-    /// This call must be followed by zero or more calls to [`SerializeMap::serialize_element`],
-    /// then a call to [`SerializeMap::end`].
-    ///
-    /// The argument is the number of elements in the map.
-    fn serialize_map(self, len: usize) -> Result<Self::SerializeMap, Self::Error>;
 
     /// Begin to serialize a product with unnamed fields.
     /// This call must be followed by zero or more calls to [`SerializeSeqProduct::serialize_element`],
@@ -203,22 +197,36 @@ pub trait Serializer: Sized {
     ) -> Result<Self::Ok, Self::Error>;
 }
 
+use ethnum::{i256, u256};
 pub use spacetimedb_bindings_macro::Serialize;
 
-use crate::AlgebraicType;
+use crate::{bsatn, buffer::BufWriter, AlgebraicType};
 
-/// A **data structure** that can be serialized into any data format supported by SATS.
+/// A **data structure** that can be serialized into any data format supported by
+/// the SpacetimeDB Algebraic Type System.
 ///
 /// In most cases, implementations of `Serialize` may be `#[derive(Serialize)]`d.
 ///
-/// The `Serialize` trait in SATS performs the same function as [`serde::Serialize`] in [`serde`].
-/// See the documentation of [`serde::Serialize`] for more information of the data model.
+/// The `Serialize` trait in SATS performs the same function as `serde::Serialize` in [`serde`].
+/// See the documentation of `serde::Serialize` for more information of the data model.
 ///
-/// [`serde::Serialize`]: ::serde::Serialize
+/// Do not manually implement this trait unless you know what you are doing.
+/// Implementations must be consistent with `Deerialize<'de> for T`, `SpacetimeType for T` and `Serialize, Deserialize for AlgebraicValue`.
+/// Implementations that are inconsistent across these traits may result in data loss.
+///
 /// [`serde`]: https://crates.io/crates/serde
 pub trait Serialize {
     /// Serialize `self` in the data format of `S` using the provided `serializer`.
     fn serialize<S: Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error>;
+
+    #[doc(hidden)]
+    /// Serialize `self` in the data format BSATN using the provided BSATN `serializer`.
+    fn serialize_into_bsatn<W: BufWriter>(
+        &self,
+        serializer: bsatn::Serializer<'_, W>,
+    ) -> Result<(), bsatn::EncodeError> {
+        self.serialize(serializer)
+    }
 
     /// Used in the `Serialize for Vec<T>` implementation
     /// to allow a specialized serialization of `Vec<T>` as bytes.
@@ -270,29 +278,6 @@ pub trait SerializeArray {
     fn serialize_element<T: Serialize + ?Sized>(&mut self, element: &T) -> Result<(), Self::Error>;
 
     /// Consumes and finalizes the array serializer returning the `Self::Ok` data.
-    fn end(self) -> Result<Self::Ok, Self::Error>;
-}
-
-/// Returned from [`Serializer::serialize_map`].
-///
-/// This provides a continuation of sorts
-/// where you can call [`serialize_entry`](SerializeMap::serialize_entry) however many times
-/// and then finally the [`end`](SerializeMap::end) is reached.
-pub trait SerializeMap {
-    /// Must match the `Ok` type of any `Serializer` that uses this type.
-    type Ok;
-
-    /// Must match the `Error` type of any `Serializer` that uses this type.
-    type Error: Error;
-
-    /// Serialize a map entry given by its `key` and `value`.
-    fn serialize_entry<K: Serialize + ?Sized, V: Serialize + ?Sized>(
-        &mut self,
-        key: &K,
-        value: &V,
-    ) -> Result<(), Self::Error>;
-
-    /// Consumes and finalizes the map serializer returning the `Self::Ok` data.
     fn end(self) -> Result<Self::Ok, Self::Error>;
 }
 
